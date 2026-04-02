@@ -4,6 +4,17 @@ const axios = require('axios');
 const AWS = require('aws-sdk');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const ffmpeg = require('fluent-ffmpeg');
+const {
+  DescriptService,
+  AssemblyAIService,
+  GoogleTranslationService,
+  iZotopeService,
+  TopazService,
+  RunwayService,
+  ClaudeService,
+} = require('./apiIntegrations');
 
 // Initialize AWS S3
 const s3 = new AWS.S3({
@@ -513,88 +524,338 @@ class VideoProcessor {
     );
   }
 
-  // Placeholder methods (implement with actual service calls)
+  // ==================== IMPLEMENTED HELPER METHODS ====================
+
+  /**
+   * Detect scene changes using FFmpeg scene filter.
+   * Returns an array of scene timestamps and suggested cut points.
+   */
   async analyzeScenes(videoPath) {
-    // Implementation here
-    return { scenes: [], cuts: [] };
+    const outputPath = `${videoPath}-scenes.txt`;
+    const threshold = parseFloat(process.env.SCENE_DETECTION_THRESHOLD || '0.3');
+    const safeThreshold = Number.isFinite(threshold) && threshold > 0 && threshold < 1 ? threshold : 0.3;
+
+    await new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .videoFilters(`select=gt(scene\\,${safeThreshold}),showinfo`)
+        .outputOptions(['-f', 'null'])
+        .output(os.platform() === 'win32' ? 'NUL' : '/dev/null')
+        .on('end', resolve)
+        .on('stderr', (line) => {
+          // Collect showinfo lines to a file for parsing
+          if (line.includes('pts_time')) {
+            fs.appendFileSync(outputPath, line + '\n');
+          }
+        })
+        .on('error', reject)
+        .run();
+    });
+
+    const scenes = [];
+    const cuts = [];
+
+    if (fs.existsSync(outputPath)) {
+      const lines = fs.readFileSync(outputPath, 'utf8').split('\n');
+      lines.forEach((line, idx) => {
+        const match = line.match(/pts_time:([\d.]+)/);
+        if (match) {
+          const time = parseFloat(match[1]);
+          scenes.push({ index: idx + 1, timestamp: time });
+          cuts.push(time);
+        }
+      });
+      fs.unlinkSync(outputPath);
+    }
+
+    return { scenes, cuts };
   }
 
+  /**
+   * Extract audio track from video using FFmpeg.
+   * Returns the path to the extracted WAV file.
+   */
   async extractAudio(videoPath) {
-    // Implementation here
-    return '';
+    const audioPath = videoPath.replace(/\.[^.]+$/, '-audio.wav');
+
+    await new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .noVideo()
+        .audioFrequency(16000)
+        .audioChannels(1)
+        .audioCodec('pcm_s16le')
+        .save(audioPath)
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    return audioPath;
   }
 
+  /**
+   * Transcribe audio using Descript API.
+   */
   async transcribeWithDescript(audioPath) {
-    // Call Descript API
-    // Implementation here
-    return { text: '', captions: [], confidence: 0.95 };
+    const descript = new DescriptService();
+    return descript.transcribeVideo(audioPath);
   }
 
+  /**
+   * Transcribe audio using AssemblyAI API (fallback).
+   */
   async transcribeWithAssemblyAI(audioPath) {
-    // Call AssemblyAI API
-    // Implementation here
-    return { text: '', captions: [], confidence: 0.95 };
+    const assemblyAI = new AssemblyAIService();
+    return assemblyAI.transcribeAudio(audioPath);
   }
 
+  /**
+   * Generate SRT subtitle file content from a transcript.
+   */
   generateSRT(transcript) {
-    // Generate SRT format subtitles
-    return '';
+    const captions = transcript.captions || [];
+    if (!captions.length) return '';
+
+    return captions
+      .map((cap) => {
+        return `${cap.index}\n${cap.startTime} --> ${cap.endTime}\n${cap.text}\n`;
+      })
+      .join('\n');
   }
 
+  /**
+   * Enhance audio using iZotope API (with FFmpeg fallback).
+   */
   async enhanceAudioWithiZotope(audioPath) {
-    // Implementation here
-    return '';
+    const izotope = new iZotopeService();
+    return izotope.enhanceAudio(audioPath);
   }
 
+  /**
+   * Basic FFmpeg audio enhancement as fallback.
+   */
   async enhanceAudioBasic(audioPath) {
-    // Implementation here
-    return '';
+    const outputPath = audioPath.replace('.wav', '-enhanced.wav');
+
+    await new Promise((resolve, reject) => {
+      ffmpeg(audioPath)
+        .audioFrequency(44100)
+        .audioChannels(2)
+        .audioCodec('pcm_s16le')
+        .audioFilters([
+          'highpass=f=75',
+          'lowpass=f=12000',
+          'volume=1.2',
+          'afftdn=nf=-25',
+        ])
+        .save(outputPath)
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    return outputPath;
   }
 
+  /**
+   * Analyze color profile of the video using FFmpeg signalstats filter.
+   */
   async analyzeColorProfile(videoPath) {
-    // Implementation here
-    return {};
+    return new Promise((resolve, reject) => {
+      let statsOutput = '';
+
+      ffmpeg(videoPath)
+        .videoFilters('signalstats')
+        .outputOptions(['-f', 'null'])
+        .output(os.platform() === 'win32' ? 'NUL' : '/dev/null')
+        .on('stderr', (line) => {
+          statsOutput += line;
+        })
+        .on('end', () => {
+          // Parse basic luminance values from signalstats output
+          const yavgMatch = statsOutput.match(/YAVG:([\d.]+)/);
+          const yavg = yavgMatch ? parseFloat(yavgMatch[1]) : 128;
+
+          let preset = 'cinematic';
+          if (yavg < 80) preset = 'bright';
+          else if (yavg > 180) preset = 'dark';
+
+          resolve({ yavg, preset });
+        })
+        .on('error', () => {
+          // Fallback to default profile if signalstats fails
+          resolve({ yavg: 128, preset: 'cinematic' });
+        })
+        .run();
+    });
   }
 
+  /**
+   * Apply color grading using Topaz Video AI API.
+   */
   async gradeVideoWithTopaz(videoPath, colorProfile) {
-    // Implementation here
-    return '';
+    const topaz = new TopazService();
+    const result = await topaz.gradeVideo(videoPath, colorProfile);
+    return result.outputPath;
   }
 
+  /**
+   * Apply color grading using FFmpeg LUT filters as ML fallback.
+   */
   async gradeVideoWithML(videoPath, colorProfile) {
-    // Implementation here
-    return '';
+    const outputPath = videoPath.replace(/\.[^.]+$/, '-graded.mp4');
+
+    // Apply cinematic-style color grading via FFmpeg curves
+    await new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .videoFilters([
+          'eq=contrast=1.1:brightness=0.02:saturation=1.2:gamma=0.95',
+          "curves=r='0/0 0.5/0.48 1/1':g='0/0 0.5/0.5 1/1':b='0/0 0.5/0.52 1/1'",
+        ])
+        .videoCodec('libx264')
+        .outputOptions(['-preset', 'fast', '-crf', '20'])
+        .save(outputPath)
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    return outputPath;
   }
 
+  /**
+   * Translate text using Google Cloud Translation API.
+   */
   async translateWithGoogle(text, targetLang) {
-    // Implementation here
-    return { text: '' };
+    const googleTranslation = new GoogleTranslationService();
+    return googleTranslation.translateText(text, targetLang);
   }
 
+  /**
+   * Map original caption timings to a translated text block.
+   * Distributes translated words proportionally across the original caption slots.
+   */
   translateCaptions(captions, translatedText) {
-    // Implementation here
-    return [];
+    if (!captions || !captions.length || !translatedText) return [];
+
+    const words = translatedText.split(/\s+/);
+    const wordsPerCaption = Math.ceil(words.length / captions.length);
+
+    return captions.map((cap, idx) => {
+      const start = idx * wordsPerCaption;
+      const slice = words.slice(start, start + wordsPerCaption).join(' ');
+      return {
+        index: cap.index,
+        startTime: cap.startTime,
+        endTime: cap.endTime,
+        text: slice || '',
+      };
+    });
   }
 
+  /**
+   * Detect faces using Runway ML API.
+   */
   async detectFaces(videoPath) {
-    // Implementation here
-    return [];
+    const runway = new RunwayService();
+    return runway.detectFaces(videoPath);
   }
 
+  /**
+   * Reframe video for a target aspect ratio.
+   * Uses Runway ML when faces are detected, otherwise falls back to FFmpeg center-crop.
+   */
   async reframeVideo(videoPath, width, height, faceData) {
-    // Implementation here
-    return '';
+    // If Runway returned face data, use the smart-crop API
+    if (faceData && faceData.faces && faceData.faces.length > 0) {
+      const runway = new RunwayService();
+      return runway.reframeVideo(videoPath, width, height, faceData);
+    }
+
+    // Fallback: FFmpeg center-crop
+    const outputPath = videoPath.replace(/\.[^.]+$/, `-reframed-${width}x${height}.mp4`);
+
+    await new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .videoFilters([
+          `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+          `crop=${width}:${height}`,
+        ])
+        .videoCodec('libx264')
+        .outputOptions(['-preset', 'fast', '-crf', '22'])
+        .save(outputPath)
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    return outputPath;
   }
 
+  /**
+   * Use Claude AI to suggest visual effects and transitions.
+   */
   async analyzeEffectsWithClaude(videoData) {
-    // Call Claude API for effect suggestions
-    // Implementation here
-    return [];
+    const claude = new ClaudeService();
+    const suggestions = await claude.suggestEffects(videoData);
+    return suggestions.effects || [];
   }
 
+  /**
+   * Compose final video that merges enhanced audio with the (optionally) color-graded video.
+   * Falls back gracefully when optional enhancements are not present.
+   */
   async composeVideo(videoData, features) {
-    // Compose final video with all enhancements
-    // Implementation here
+    console.log(`[${this.jobId}] Starting final video composition`);
+
+    const videoPath = await this.downloadFromS3(videoData.s3_key);
+    const outputPath = videoPath.replace(/\.[^.]+$/, '-final.mp4');
+    const tempFiles = [videoPath, outputPath];
+
+    let inputVideo = videoPath;
+    let gradedPath = null;
+    let enhancedAudioPath = null;
+
+    // Use color-graded video if available (videoUrl is stored as the S3 key)
+    if (features.colorGrading && this.results.colorGrading && this.results.colorGrading.videoUrl) {
+      gradedPath = await this.downloadFromS3(this.results.colorGrading.videoUrl);
+      tempFiles.push(gradedPath);
+      inputVideo = gradedPath;
+    }
+
+    // Build FFmpeg command
+    const command = ffmpeg(inputVideo).videoCodec('libx264').outputOptions(['-preset', 'fast', '-crf', '20']);
+
+    // Merge enhanced audio if available (audioUrl is stored as the S3 key)
+    if (features.audioEnhancement && this.results.audioEnhancement && this.results.audioEnhancement.audioUrl) {
+      enhancedAudioPath = await this.downloadFromS3(this.results.audioEnhancement.audioUrl);
+      tempFiles.push(enhancedAudioPath);
+      command
+        .addInput(enhancedAudioPath)
+        .audioCodec('aac')
+        .outputOptions(['-map', '0:v:0', '-map', '1:a:0', '-shortest']);
+    } else {
+      command.audioCodec('copy');
+    }
+
+    await new Promise((resolve, reject) => {
+      command
+        .save(outputPath)
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    // Upload composed video to S3
+    const finalKey = `videos/${this.userId}/${this.jobId}/final.mp4`;
+    await this.uploadFileToS3(finalKey, outputPath);
+
+    this.results.finalVideo = { videoUrl: finalKey };
+
+    await this.saveProcessingResult('finalVideo', { videoUrl: finalKey });
+
+    // Clean up all temp files
+    for (const f of tempFiles) {
+      if (fs.existsSync(f)) {
+        fs.unlinkSync(f);
+      }
+    }
+
+    console.log(`[${this.jobId}] Final video composition completed`);
   }
 }
 

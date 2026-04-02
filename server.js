@@ -2,21 +2,55 @@
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const dotenv = require('dotenv');
 const path = require('path');
 const { Pool } = require('pg');
 const Redis = require('redis');
 const Queue = require('bull');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const AWS = require('aws-sdk');
+const bcryptjs = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const fs = require('fs');
 
 dotenv.config();
 
 // Initialize Express
 const app = express();
 
-// Middleware
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// ==================== SECURITY MIDDLEWARE ====================
+
+app.use(helmet());
+
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || '*',
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type'],
+}));
+
+// General rate limiter
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' },
+});
+app.use(limiter);
+
+// Stricter limiter for auth endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many authentication attempts, please try again later' },
+});
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+// ==================== DATABASE & QUEUE ====================
 
 // Initialize Database
 const pool = new Pool({
@@ -46,16 +80,30 @@ app.use((req, res, next) => {
 
 // ==================== ROUTES ====================
 
+// Input validation helper
+function validateEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function validatePassword(password) {
+  return typeof password === 'string' && password.length >= 8;
+}
+
 // 1. AUTHENTICATION ROUTES
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-    const bcryptjs = require('bcryptjs');
-    const jwt = require('jsonwebtoken');
+
+    if (!email || !validateEmail(email)) {
+      return res.status(400).json({ error: 'Valid email is required' });
+    }
+    if (!validatePassword(password)) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
 
     // Check if user exists
     const userExists = await pool.query(
-      'SELECT * FROM users WHERE email = $1',
+      'SELECT id FROM users WHERE email = $1',
       [email]
     );
 
@@ -64,7 +112,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     // Hash password
-    const passwordHash = await bcryptjs.hash(password, 10);
+    const passwordHash = await bcryptjs.hash(password, 12);
 
     // Create user
     const result = await pool.query(
@@ -91,11 +139,13 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
-    const bcryptjs = require('bcryptjs');
-    const jwt = require('jsonwebtoken');
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
 
     // Find user
     const result = await pool.query(
@@ -133,78 +183,116 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// ==================== MULTER SETUP ====================
+
+const ALLOWED_MIME_TYPES = ['video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska', 'video/webm'];
+const MAX_FILE_SIZE_BYTES = parseInt(process.env.MAX_FILE_SIZE_MB || '500') * 1024 * 1024;
+
+const upload = multer({
+  dest: process.env.LOCAL_STORAGE || './uploads',
+  limits: { fileSize: MAX_FILE_SIZE_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Unsupported file type. Allowed: mp4, mov, avi, mkv, webm'));
+    }
+  },
+});
+
+const s3 = new AWS.S3({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION,
+});
+
 // 2. VIDEO UPLOAD & MANAGEMENT ROUTES
-app.post('/api/videos/upload', authenticateToken, async (req, res) => {
-  try {
-    const multer = require('multer');
-    const upload = multer({ dest: process.env.LOCAL_STORAGE || './uploads' });
+app.post('/api/videos/upload', authenticateToken, (req, res) => {
+  upload.single('video')(req, res, async (err) => {
+    if (err) {
+      return res.status(400).json({ error: err.message || 'File upload failed' });
+    }
 
-    upload.single('video')(req, res, async (err) => {
-      if (err) {
-        return res.status(400).json({ error: 'File upload failed' });
-      }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No video file provided' });
+    }
 
-      const { originalname, size, mimetype } = req.file;
-      const userId = req.user.userId;
+    const { originalname, size, mimetype } = req.file;
+    const userId = req.user.userId;
 
+    try {
       // Extract video metadata using FFmpeg
       const ffmpeg = require('fluent-ffmpeg');
-      const ffprobe = require('ffprobe');
 
-      ffprobe(req.file.path, async (err, probeData) => {
-        if (err) {
-          return res.status(400).json({ error: 'Invalid video file' });
-        }
-
-        const videoStream = probeData.streams.find(s => s.codec_type === 'video');
-        const duration = probeData.format.duration;
-        const resolution = `${videoStream.width}x${videoStream.height}`;
-        const fps = videoStream.r_frame_rate
-          ? eval(videoStream.r_frame_rate)
-          : 30;
-
-        // Upload to S3
-        const AWS = require('aws-sdk');
-        const s3 = new AWS.S3();
-        const fs = require('fs');
-
-        const fileContent = fs.readFileSync(req.file.path);
-        const s3Key = `videos/${userId}/${Date.now()}-${originalname}`;
-
-        const s3Params = {
-          Bucket: process.env.AWS_S3_BUCKET,
-          Key: s3Key,
-          Body: fileContent,
-          ContentType: mimetype,
-        };
-
-        s3.upload(s3Params, async (err, data) => {
-          if (err) {
-            return res.status(500).json({ error: 'S3 upload failed' });
-          }
-
-          // Save to database
-          const videoResult = await pool.query(
-            `INSERT INTO videos (user_id, original_filename, file_size, duration, resolution, fps, s3_key, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             RETURNING *`,
-            [userId, originalname, size, duration, resolution, fps, s3Key, 'uploaded']
-          );
-
-          // Clean up local file
-          fs.unlinkSync(req.file.path);
-
-          res.status(201).json({
-            video: videoResult.rows[0],
-            message: 'Video uploaded successfully',
-          });
+      const probeData = await new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(req.file.path, (probeErr, data) => {
+          if (probeErr) reject(probeErr);
+          else resolve(data);
         });
       });
-    });
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Upload failed' });
-  }
+
+      const videoStream = probeData.streams.find(s => s.codec_type === 'video');
+      if (!videoStream) {
+        fs.unlinkSync(req.file.path);
+        return res.status(400).json({ error: 'File contains no video stream' });
+      }
+
+      const duration = probeData.format.duration;
+      const resolution = `${videoStream.width}x${videoStream.height}`;
+
+      // Safely evaluate fractional frame rate (e.g. "30000/1001")
+      let fps = 30;
+      if (videoStream.r_frame_rate) {
+        const parts = videoStream.r_frame_rate.split('/');
+        fps = parts.length === 2 ? parseFloat(parts[0]) / parseFloat(parts[1]) : parseFloat(parts[0]);
+      }
+
+      // Sanitize original filename: strip path, collapse multiple dots, allow only safe chars
+      const basename = path.basename(originalname);
+      const ext = path.extname(basename).toLowerCase();
+      const nameOnly = path.basename(basename, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const safeFilename = `${nameOnly}${ext}`;
+      const s3Key = `videos/${userId}/${Date.now()}-${safeFilename}`;
+
+      const fileContent = fs.readFileSync(req.file.path);
+      const s3Params = {
+        Bucket: process.env.AWS_S3_BUCKET,
+        Key: s3Key,
+        Body: fileContent,
+        ContentType: mimetype,
+      };
+
+      await new Promise((resolve, reject) => {
+        s3.upload(s3Params, (uploadErr, data) => {
+          if (uploadErr) reject(uploadErr);
+          else resolve(data);
+        });
+      });
+
+      // Save to database
+      const videoResult = await pool.query(
+        `INSERT INTO videos (user_id, original_filename, file_size, duration, resolution, fps, s3_key, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *`,
+        [userId, safeFilename, size, duration, resolution, fps, s3Key, 'uploaded']
+      );
+
+      // Clean up local file
+      fs.unlinkSync(req.file.path);
+
+      res.status(201).json({
+        video: videoResult.rows[0],
+        message: 'Video uploaded successfully',
+      });
+    } catch (error) {
+      // Clean up local file on error
+      if (req.file && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      console.error('Upload error:', error);
+      res.status(500).json({ error: 'Upload failed' });
+    }
+  });
 });
 
 app.get('/api/videos', authenticateToken, async (req, res) => {
@@ -250,9 +338,24 @@ app.post('/api/process/start', authenticateToken, async (req, res) => {
     const { videoId, features } = req.body;
     const userId = req.user.userId;
 
+    if (!videoId) {
+      return res.status(400).json({ error: 'videoId is required' });
+    }
+
+    // Merge requested features with defaults; only allow known feature keys
+    const allowedFeatures = Object.keys(allFeaturesDefault);
+    const sanitizedFeatures = { ...allFeaturesDefault };
+    if (features && typeof features === 'object') {
+      allowedFeatures.forEach((key) => {
+        if (typeof features[key] === 'boolean') {
+          sanitizedFeatures[key] = features[key];
+        }
+      });
+    }
+
     // Verify video belongs to user
     const videoResult = await pool.query(
-      'SELECT * FROM videos WHERE id = $1 AND user_id = $2',
+      'SELECT id FROM videos WHERE id = $1 AND user_id = $2',
       [videoId, userId]
     );
 
@@ -265,7 +368,7 @@ app.post('/api/process/start', authenticateToken, async (req, res) => {
       `INSERT INTO processing_jobs (video_id, user_id, job_type, features_enabled, status)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [videoId, userId, 'full_process', JSON.stringify(features || allFeaturesDefault), 'queued']
+      [videoId, userId, 'full_process', JSON.stringify(sanitizedFeatures), 'queued']
     );
 
     const job = jobResult.rows[0];
@@ -276,7 +379,7 @@ app.post('/api/process/start', authenticateToken, async (req, res) => {
         jobId: job.id,
         videoId,
         userId,
-        features: features || allFeaturesDefault,
+        features: sanitizedFeatures,
       },
       {
         priority: 1,
@@ -348,14 +451,15 @@ app.get('/api/download/:jobId/:feature', authenticateToken, async (req, res) => 
     const processingResult = result.rows[0];
     const s3Key = processingResult.s3_output_key;
 
-    // Generate S3 signed URL
-    const AWS = require('aws-sdk');
-    const s3 = new AWS.S3();
+    if (!s3Key) {
+      return res.status(404).json({ error: 'No output file available for this result' });
+    }
 
+    // Generate S3 signed URL (valid for 1 hour)
     const signedUrl = s3.getSignedUrl('getObject', {
       Bucket: process.env.AWS_S3_BUCKET,
       Key: s3Key,
-      Expires: 3600, // 1 hour
+      Expires: 3600,
     });
 
     res.json({ downloadUrl: signedUrl });
@@ -376,8 +480,6 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  const jwt = require('jsonwebtoken');
-
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) {
       return res.status(403).json({ error: 'Invalid token' });
@@ -393,15 +495,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
-// ==================== START SERVER ====================
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📊 Environment: ${process.env.NODE_ENV}`);
-});
-
 // Default features
 const allFeaturesDefault = {
   sceneDetection: true,
@@ -412,6 +505,15 @@ const allFeaturesDefault = {
   autoReframing: true,
   effectSuggestions: true,
 };
+
+// ==================== START SERVER ====================
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Environment: ${process.env.NODE_ENV}`);
+});
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
