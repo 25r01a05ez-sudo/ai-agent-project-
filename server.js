@@ -25,7 +25,7 @@ const app = express();
 app.use(helmet());
 
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
+  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
   methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Authorization', 'Content-Type'],
 }));
@@ -80,9 +80,13 @@ app.use((req, res, next) => {
 
 // ==================== ROUTES ====================
 
-// Input validation helper
+// Input validation helper - simple and ReDoS-safe
 function validateEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  if (typeof email !== 'string' || email.length > 320) return false;
+  const atIdx = email.indexOf('@');
+  if (atIdx <= 0 || atIdx === email.length - 1) return false;
+  const domain = email.slice(atIdx + 1);
+  return domain.includes('.');
 }
 
 function validatePassword(password) {
@@ -188,8 +192,15 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 const ALLOWED_MIME_TYPES = ['video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska', 'video/webm'];
 const MAX_FILE_SIZE_BYTES = parseInt(process.env.MAX_FILE_SIZE_MB || '500') * 1024 * 1024;
 
+const UPLOAD_DIR = path.resolve(process.env.LOCAL_STORAGE || './uploads');
+
+// Ensure upload directory exists
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
 const upload = multer({
-  dest: process.env.LOCAL_STORAGE || './uploads',
+  dest: UPLOAD_DIR,
   limits: { fileSize: MAX_FILE_SIZE_BYTES },
   fileFilter: (_req, file, cb) => {
     if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
@@ -206,6 +217,21 @@ const s3 = new AWS.S3({
   region: process.env.AWS_REGION,
 });
 
+// Safely delete a temp upload file (only accepts multer-generated hex filenames)
+function safeDeleteUpload(filename) {
+  try {
+    // Strip everything except hex chars; multer names files with hex strings only
+    const safeFilename = String(filename || '').replace(/[^a-f0-9]/g, '');
+    if (!safeFilename || safeFilename !== String(filename)) return;
+    const fullPath = path.join(UPLOAD_DIR, safeFilename);
+    if (fs.existsSync(fullPath)) {
+      fs.unlinkSync(fullPath);
+    }
+  } catch (_) {
+    // Ignore cleanup errors
+  }
+}
+
 // 2. VIDEO UPLOAD & MANAGEMENT ROUTES
 app.post('/api/videos/upload', authenticateToken, (req, res) => {
   upload.single('video')(req, res, async (err) => {
@@ -220,12 +246,20 @@ app.post('/api/videos/upload', authenticateToken, (req, res) => {
     const { originalname, size, mimetype } = req.file;
     const userId = req.user.userId;
 
+    // Multer generates hex filenames; sanitize it to strip any directory traversal
+    const uploadedFilename = req.file.filename;
+    const safeUploadedFilename = String(uploadedFilename || '').replace(/[^a-f0-9]/g, '');
+    if (!safeUploadedFilename || safeUploadedFilename !== uploadedFilename) {
+      return res.status(400).json({ error: 'Invalid file reference' });
+    }
+    const tempFilePath = path.join(UPLOAD_DIR, safeUploadedFilename);
+
     try {
       // Extract video metadata using FFmpeg
-      const ffmpeg = require('fluent-ffmpeg');
+      const ffmpegFluent = require('fluent-ffmpeg');
 
       const probeData = await new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(req.file.path, (probeErr, data) => {
+        ffmpegFluent.ffprobe(tempFilePath, (probeErr, data) => {
           if (probeErr) reject(probeErr);
           else resolve(data);
         });
@@ -233,7 +267,7 @@ app.post('/api/videos/upload', authenticateToken, (req, res) => {
 
       const videoStream = probeData.streams.find(s => s.codec_type === 'video');
       if (!videoStream) {
-        fs.unlinkSync(req.file.path);
+        safeDeleteUpload(safeUploadedFilename);
         return res.status(400).json({ error: 'File contains no video stream' });
       }
 
@@ -254,7 +288,7 @@ app.post('/api/videos/upload', authenticateToken, (req, res) => {
       const safeFilename = `${nameOnly}${ext}`;
       const s3Key = `videos/${userId}/${Date.now()}-${safeFilename}`;
 
-      const fileContent = fs.readFileSync(req.file.path);
+      const fileContent = fs.readFileSync(tempFilePath);
       const s3Params = {
         Bucket: process.env.AWS_S3_BUCKET,
         Key: s3Key,
@@ -278,7 +312,7 @@ app.post('/api/videos/upload', authenticateToken, (req, res) => {
       );
 
       // Clean up local file
-      fs.unlinkSync(req.file.path);
+      safeDeleteUpload(safeUploadedFilename);
 
       res.status(201).json({
         video: videoResult.rows[0],
@@ -286,9 +320,7 @@ app.post('/api/videos/upload', authenticateToken, (req, res) => {
       });
     } catch (error) {
       // Clean up local file on error
-      if (req.file && fs.existsSync(req.file.path)) {
-        fs.unlinkSync(req.file.path);
-      }
+      safeDeleteUpload(safeUploadedFilename);
       console.error('Upload error:', error);
       res.status(500).json({ error: 'Upload failed' });
     }
